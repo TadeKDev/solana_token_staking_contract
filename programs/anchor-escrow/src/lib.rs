@@ -9,49 +9,55 @@ declare_id!("3GtHR9kYEejJP9X6zpSiGtSLEWY8ZJdawsEWAJ55h4sB");
 #[program]
 pub mod anchor_escrow {
     use super::*;
+
+    // need to call this function after deploying smart contract to set admin wallet
+    pub fn init_admin(ctx: Context<InitAdmin>) -> Result<()> {
+        ctx.accounts.admin_state.admin = *ctx.accounts.admin.key;
+        ctx.accounts.admin_state.bump = *ctx.bumps.get("admin_state").unwrap();
+        ctx.accounts.admin_state.admin_fee = 0;
+        ctx.accounts.admin_state.reward_rate = 0;
+        ctx.accounts.admin_state.lock_period = 0;
+        ctx.accounts.admin_state.total_amount = 0;
+        ctx.accounts.admin_state.locked_amount = 0;
+        ctx.accounts.admin_state.staked_user_amount = 0;
+        Ok(())
+    }
+
+    // change admin wallet using this function
+    pub fn change_admin(ctx: Context<ChangeAdmin>) -> Result<()> {
+        ctx.accounts.admin_state.admin = *ctx.accounts.new_admin.key;
+
+        Ok(())
+    }
+
+    //  update necessary parameters like fee/stake reward/lock period
+    pub fn update_admin_info(
+        ctx: Context<UpdateAdminInfo>,
+        admin_fee: u64,
+        reward_rate: u64,
+        lock_period: u64,
+    ) -> Result<()> {
+        ctx.accounts.admin_state.admin_fee = admin_fee;
+        ctx.accounts.admin_state.reward_rate = reward_rate;
+        ctx.accounts.admin_state.lock_period = lock_period;
+
+        Ok(())
+    }
 }
 
 #[derive(Accounts)]
-#[instruction(escrow_seed: u64, initializer_amount: [u64;5])]
-pub struct Initialize<'info> {
+pub struct InitAdmin<'info> {
     /// CHECK: This is not dangerous because we don't read or write from this account
     #[account(mut)]
-    pub initializer: Signer<'info>,
-    /// CHECK: This is not dangerous because we don't read or write from this account
-    #[account(mut)]
-    pub taker: AccountInfo<'info>,
+    pub admin: Signer<'info>,
     #[account(
-        mut,
-        seeds = [b"state".as_ref(), b"admin".as_ref()],
-        bump = admin_state.bump
-    )]
+         init,
+         seeds = [b"state".as_ref(), b"admin".as_ref()],
+         bump,
+         payer = admin,
+         space = AdminState::space()
+     )]
     pub admin_state: Box<Account<'info, AdminState>>,
-    #[account(mut)]
-    pub mint: Account<'info, Mint>,
-    #[account(
-        init,
-        seeds = [b"vault".as_ref(), &escrow_seed.to_le_bytes()],
-        bump,
-        payer = initializer,
-        token::mint = mint,
-        token::authority = initializer,
-    )]
-    pub vault: Account<'info, TokenAccount>,
-    #[account(
-        mut,
-        token::mint = mint,
-        token::authority = initializer,
-        constraint = initializer_deposit_token_account.amount >=(initializer_amount[0]+initializer_amount[1]+initializer_amount[2]+initializer_amount[3]+initializer_amount[4])
-    )]
-    pub initializer_deposit_token_account: Account<'info, TokenAccount>,
-    #[account(
-        init,
-        seeds = [b"state".as_ref(), &escrow_seed.to_le_bytes()],
-        bump,
-        payer = initializer,
-        space = EscrowState::space()
-    )]
-    pub escrow_state: Box<Account<'info, EscrowState>>,
     /// CHECK: This is not dangerous because we don't read or write from this account
     pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
@@ -59,25 +65,54 @@ pub struct Initialize<'info> {
     pub token_program: Program<'info, Token>,
 }
 
+#[derive(Accounts)]
+pub struct ChangeAdmin<'info> {
+    /// CHECK: This is not dangerous because we don't read or write from this account
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    /// CHECK: This is not dangerous because we don't read or write from this account
+    #[account(mut)]
+    pub new_admin: AccountInfo<'info>,
+    #[account(
+        mut,
+        constraint = admin_state.admin == *admin.key,
+        seeds = [b"state".as_ref(), b"admin".as_ref()],
+        bump = admin_state.bump
+    )]
+    pub admin_state: Box<Account<'info, AdminState>>,
+}
+
+#[derive(Accounts)]
+#[instruction(admin_fee: u64, reward_rate: u64, lock_period: u64)]
+pub struct UpdateAdminInfo<'info> {
+    /// CHECK: This is not dangerous because we don't read or write from this account
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    /// CHECK: This is not dangerous because we don't read or write from this account
+    #[account(
+        mut,
+        constraint = admin_state.admin == *admin.key,
+        seeds = [b"state".as_ref(), b"admin".as_ref()],
+        bump = admin_state.bump
+    )]
+    pub admin_state: Box<Account<'info, AdminState>>,
+}
+
 #[account]
 pub struct AdminState {
     pub bump: u8,
-    pub admin_fee: u64,
-    pub resolver_fee: u64,
-    pub admin1: Pubkey,
-    pub admin2: Pubkey,
-    pub resolver: Pubkey,
-    pub total_amount: u64,
-    pub locked_amount: u64,
-    pub active_escrow: u64,
-    pub completed_escrow: u64,
-    pub disputed_escrow: u64,
-    pub refunded_escrow: u64,
+    pub admin: Pubkey,
+    pub admin_fee: u64,     // admin will get fee when users withdraw stake reward
+    pub reward_rate: u64,   // reward rate
+    pub lock_period: u64,   // lock period for staking
+    pub total_amount: u64,  // total staked amount all time
+    pub locked_amount: u64, // current locked amount
+    pub staked_user_amount: u64,
 }
 
 impl AdminState {
     pub fn space() -> usize {
-        8 + 161
+        8 + 1 + 32 + 8 + 8 + 8 + 8 + 8 + 8
     }
 }
 
@@ -97,24 +132,5 @@ pub struct EscrowState {
 impl EscrowState {
     pub fn space() -> usize {
         8 + 148
-    }
-}
-
-impl<'info> Initialize<'info> {
-    fn into_transfer_to_pda_context(&self) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
-        let cpi_accounts = Transfer {
-            from: self.initializer_deposit_token_account.to_account_info(),
-            to: self.vault.to_account_info(),
-            authority: self.initializer.to_account_info(),
-        };
-        CpiContext::new(self.token_program.to_account_info(), cpi_accounts)
-    }
-
-    fn into_set_authority_context(&self) -> CpiContext<'_, '_, '_, 'info, SetAuthority<'info>> {
-        let cpi_accounts = SetAuthority {
-            account_or_mint: self.vault.to_account_info(),
-            current_authority: self.initializer.to_account_info(),
-        };
-        CpiContext::new(self.token_program.to_account_info(), cpi_accounts)
     }
 }
