@@ -1,1 +1,1 @@
-- `anchor test`: run example staking program 
+have to check admin account because scammers can send different admin account
