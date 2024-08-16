@@ -13,6 +13,7 @@ pub mod anchor_escrow {
     // need to call this function after deploying smart contract to set admin wallet
     pub fn init_admin(ctx: Context<InitAdmin>) -> Result<()> {
         ctx.accounts.admin_state.admin = *ctx.accounts.admin.key;
+        ctx.accounts.admin_state.stake_token = *ctx.accounts.stake_token.to_account_info().key;
         ctx.accounts.admin_state.bump = *ctx.bumps.get("admin_state").unwrap();
         ctx.accounts.admin_state.admin_fee = 0;
         ctx.accounts.admin_state.reward_rate = 0;
@@ -58,6 +59,18 @@ pub struct InitAdmin<'info> {
          space = AdminState::space()
      )]
     pub admin_state: Box<Account<'info, AdminState>>,
+    #[account(mut)]
+    pub stake_token: Account<'info, Mint>,
+    // create vault to lock tokens
+    #[account(
+        init,
+        seeds = [b"vault".as_ref(), stake_token.key().as_ref()],
+        bump,
+        payer = admin,
+        token::mint = stake_token,
+        token::authority = vault,
+    )]
+    pub vault: Account<'info, TokenAccount>,
     /// CHECK: This is not dangerous because we don't read or write from this account
     pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
@@ -98,6 +111,47 @@ pub struct UpdateAdminInfo<'info> {
     pub admin_state: Box<Account<'info, AdminState>>,
 }
 
+#[derive(Accounts)]
+#[instruction(stake_amount: u64)]
+pub struct Stake<'info> {
+    /// CHECK: This is not dangerous because we don't read or write from this account
+    #[account(mut)]
+    pub staker: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [b"state".as_ref(), b"admin".as_ref()],
+        bump = admin_state.bump
+    )]
+    pub admin_state: Box<Account<'info, AdminState>>,
+    #[account(mut)]
+    pub stake_token: Account<'info, Mint>,
+    #[account(
+        seeds = [b"vault".as_ref(), stake_token.key().as_ref()],
+        bump,
+    )]
+    pub vault: Account<'info, TokenAccount>,
+    #[account(
+        mut,
+        token::mint = stake_token,
+        token::authority = staker,
+        constraint = staker_deposit_token_account.amount >=stake_amount
+    )]
+    pub staker_deposit_token_account: Account<'info, TokenAccount>,
+    #[account(
+        init_if_needed,
+        seeds = [b"state".as_ref(), b"user".as_ref(), staker.key().as_ref()],
+        bump,
+        payer = staker,
+        space = UserState::space()
+    )]
+    pub user_state: Box<Account<'info, UserState>>,
+    /// CHECK: This is not dangerous because we don't read or write from this account
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+    /// CHECK: This is not dangerous because we don't read or write from this account
+    pub token_program: Program<'info, Token>,
+}
+
 #[account]
 pub struct AdminState {
     pub bump: u8,
@@ -108,29 +162,27 @@ pub struct AdminState {
     pub total_amount: u64,  // total staked amount all time
     pub locked_amount: u64, // current locked amount
     pub staked_user_amount: u64,
+    pub stake_token: Pubkey,
 }
 
 impl AdminState {
     pub fn space() -> usize {
-        8 + 1 + 32 + 8 + 8 + 8 + 8 + 8 + 8
+        8 + 1 + 32 + 8 + 8 + 8 + 8 + 8 + 8 + 32
     }
 }
 
 #[account]
-pub struct EscrowState {
-    pub random_seed: u64,
-    pub initializer_key: Pubkey,
-    pub taker: Pubkey,
-    pub initializer_amount: [u64; 5],
-    pub dispute_status: bool,
-    pub refund_status: bool,
-    pub mint: Pubkey,
+pub struct UserState {
     pub bump: u8,
-    pub vault_bump: u8,
+    pub stake_date: u64,
+    pub stake_amount: u64,
+    // will be added when user stake more. previous staked amount was 100,
+    // and user stakes 200 tokens again, then we need to calculate current reward and need to add to previous_stake_reward
+    pub previous_stake_reward: u64,
 }
 
-impl EscrowState {
+impl UserState {
     pub fn space() -> usize {
-        8 + 148
+        8 + 1 + 8 + 8 + 8
     }
 }
