@@ -1,8 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{
-    self, Mint, Token,
-    TokenAccount, Transfer,
-};
+use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
 declare_id!("3GtHR9kYEejJP9X6zpSiGtSLEWY8ZJdawsEWAJ55h4sB");
 
@@ -49,18 +46,16 @@ pub mod anchor_escrow {
         let clock = Clock::get()?;
         let diff_time = clock.unix_timestamp - ctx.accounts.user_state.stake_date;
         ctx.accounts.user_state.previous_stake_reward = ctx.accounts.user_state.stake_amount
-            * ctx.accounts.admin_state.reward_rate 
+            * ctx.accounts.admin_state.reward_rate / 100  // need to divide by 100 ->> 0.2 = 20 / 100
             * (diff_time as u64) // locking time
-            / (86400 * 180); // 180 lock days
+            / ctx.accounts.admin_state.lock_period
+            + ctx.accounts.user_state.previous_stake_reward; // 180 lock days
 
         ctx.accounts.user_state.stake_amount = ctx.accounts.user_state.stake_amount + stake_amount;
         ctx.accounts.user_state.stake_date = clock.unix_timestamp;
 
         // transfer tokens to vault account
-        token::transfer(
-            ctx.accounts.into_transfer_to_pda_context(),
-            stake_amount
-        )?;
+        token::transfer(ctx.accounts.into_transfer_to_pda_context(), stake_amount)?;
 
         Ok(())
     }
@@ -70,33 +65,44 @@ pub mod anchor_escrow {
         let clock = Clock::get()?;
         let diff_time = clock.unix_timestamp - ctx.accounts.user_state.stake_date;
         let stake_reward = ctx.accounts.user_state.stake_amount
-            * ctx.accounts.admin_state.reward_rate 
+            * ctx.accounts.admin_state.reward_rate / 100  // need to divide by 100 ->> 0.2 = 20 / 100
             * (diff_time as u64) // locking time
-            / (86400 * 180); // 180 lock days
+            / ctx.accounts.admin_state.lock_period
+            + ctx.accounts.user_state.previous_stake_reward; // 180 lock days
 
         ctx.accounts.user_state.previous_stake_reward = 0;
 
         ctx.accounts.user_state.stake_date = clock.unix_timestamp;
 
         let transfer_ctx = CpiContext::new(
-            ctx.accounts.token_program.to_account_info(), 
+            ctx.accounts.token_program.to_account_info(),
             Transfer {
-                from: ctx.accounts.vault.to_account_info(), 
+                from: ctx.accounts.vault.to_account_info(),
                 to: ctx.accounts.staker_deposit_token_account.to_account_info(),
-                authority: ctx.accounts.vault.to_account_info(), 
-            }
+                authority: ctx.accounts.vault.to_account_info(),
+            },
         );
         let bump = *ctx.bumps.get("vault").unwrap();
         let stake_token_key = ctx.accounts.stake_token.key();
-        let pda_sign = &[
-            b"vault",
-            stake_token_key.as_ref(),
-            &[bump],
-        ];
+        let pda_sign = &[&b"vault"[..], stake_token_key.as_ref(), &[bump]];
 
         token::transfer(
-            transfer_ctx.with_signer(&[pda_sign]), 
-            stake_reward
+            transfer_ctx.with_signer(&[pda_sign]),
+            stake_reward * (100 - ctx.accounts.admin_state.admin_fee) / 100,
+        )?;
+
+        let transfer_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.vault.to_account_info(),
+                to: ctx.accounts.admin_deposit_token_account.to_account_info(),
+                authority: ctx.accounts.vault.to_account_info(),
+            },
+        );
+
+        token::transfer(
+            transfer_ctx.with_signer(&[pda_sign]),
+            stake_reward * ctx.accounts.admin_state.admin_fee / 100,
         )?;
 
         Ok(())
@@ -107,36 +113,48 @@ pub mod anchor_escrow {
         let clock = Clock::get()?;
         let diff_time = clock.unix_timestamp - ctx.accounts.user_state.stake_date;
         let stake_reward = ctx.accounts.user_state.stake_amount
-            * ctx.accounts.admin_state.reward_rate 
+            * ctx.accounts.admin_state.reward_rate / 100   // need to divide by 100 ->> 0.2 = 20 / 100
             * (diff_time as u64) // locking time
-            / (86400 * 180); // 180 lock days
+            / ctx.accounts.admin_state.lock_period
+            + ctx.accounts.user_state.previous_stake_reward; // 180 lock days
 
         ctx.accounts.user_state.previous_stake_reward = 0;
 
         ctx.accounts.user_state.stake_date = clock.unix_timestamp;
 
         let transfer_ctx = CpiContext::new(
-            ctx.accounts.token_program.to_account_info(), 
+            ctx.accounts.token_program.to_account_info(),
             Transfer {
-                from: ctx.accounts.vault.to_account_info(), 
+                from: ctx.accounts.vault.to_account_info(),
                 to: ctx.accounts.staker_deposit_token_account.to_account_info(),
-                authority: ctx.accounts.vault.to_account_info(), 
-            }
+                authority: ctx.accounts.vault.to_account_info(),
+            },
         );
         let bump = *ctx.bumps.get("vault").unwrap();
         let stake_token_key = ctx.accounts.stake_token.key();
-        let pda_sign = &[
-            b"vault",
-            stake_token_key.as_ref(),
-            &[bump],
-        ];
+        let pda_sign = &[&b"vault"[..], stake_token_key.as_ref(), &[bump]];
 
         token::transfer(
-            transfer_ctx.with_signer(&[pda_sign]), 
-            stake_reward + ctx.accounts.user_state.stake_amount,
+            transfer_ctx.with_signer(&[pda_sign]),
+            stake_reward * (100 - ctx.accounts.admin_state.admin_fee) / 100
+                + ctx.accounts.user_state.stake_amount,
         )?;
 
         ctx.accounts.user_state.stake_amount = 0;
+
+        let transfer_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.vault.to_account_info(),
+                to: ctx.accounts.admin_deposit_token_account.to_account_info(),
+                authority: ctx.accounts.vault.to_account_info(),
+            },
+        );
+
+        token::transfer(
+            transfer_ctx.with_signer(&[pda_sign]),
+            stake_reward * ctx.accounts.admin_state.admin_fee / 100,
+        )?;
 
         Ok(())
     }
@@ -248,12 +266,13 @@ pub struct Stake<'info> {
     pub token_program: Program<'info, Token>,
 }
 
-
 #[derive(Accounts)]
 pub struct GetReward<'info> {
     /// CHECK: This is not dangerous because we don't read or write from this account
     #[account(mut)]
     pub staker: Signer<'info>,
+    #[account(mut)]
+    pub admin: AccountInfo<'info>,
     #[account(
         mut,
         seeds = [b"state".as_ref(), b"admin".as_ref()],
@@ -273,6 +292,13 @@ pub struct GetReward<'info> {
         token::authority = staker,
     )]
     pub staker_deposit_token_account: Account<'info, TokenAccount>,
+    #[account(
+        mut,
+        token::mint = stake_token,
+        token::authority = admin,
+        constraint = admin_state.admin == admin.key()
+    )]
+    pub admin_deposit_token_account: Account<'info, TokenAccount>,
     #[account(
         init_if_needed,
         seeds = [b"state".as_ref(), b"user".as_ref(), staker.key().as_ref()],
@@ -293,6 +319,8 @@ pub struct Unstake<'info> {
     /// CHECK: This is not dangerous because we don't read or write from this account
     #[account(mut)]
     pub staker: Signer<'info>,
+    #[account(mut)]
+    pub admin: AccountInfo<'info>,
     #[account(
         mut,
         seeds = [b"state".as_ref(), b"admin".as_ref()],
@@ -312,6 +340,13 @@ pub struct Unstake<'info> {
         token::authority = staker,
     )]
     pub staker_deposit_token_account: Account<'info, TokenAccount>,
+    #[account(
+        mut,
+        token::mint = stake_token,
+        token::authority = admin,
+        constraint = admin_state.admin == admin.key()
+    )]
+    pub admin_deposit_token_account: Account<'info, TokenAccount>,
     #[account(
         init_if_needed,
         seeds = [b"state".as_ref(), b"user".as_ref(), staker.key().as_ref()],
@@ -361,7 +396,6 @@ impl UserState {
         8 + 1 + 8 + 8 + 8
     }
 }
-
 
 impl<'info> Stake<'info> {
     fn into_transfer_to_pda_context(&self) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
