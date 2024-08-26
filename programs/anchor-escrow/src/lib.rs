@@ -1,7 +1,8 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
+use std::convert::TryInto;
 
-declare_id!("3GtHR9kYEejJP9X6zpSiGtSLEWY8ZJdawsEWAJ55h4sB");
+declare_id!("2gSyVrvohTuae4WQZcrVUdV5vhfxWmbGkPjYJjiZx6rX");
 
 #[program]
 pub mod anchor_escrow {
@@ -15,6 +16,7 @@ pub mod anchor_escrow {
         ctx.accounts.admin_state.admin_fee = 0;
         ctx.accounts.admin_state.reward_rate = 0;
         ctx.accounts.admin_state.lock_period = 0;
+        ctx.accounts.admin_state.reward_pool_amount = 0;
         ctx.accounts.admin_state.total_amount = 0;
         ctx.accounts.admin_state.locked_amount = 0;
         ctx.accounts.admin_state.staked_user_amount = 0;
@@ -42,6 +44,16 @@ pub mod anchor_escrow {
         Ok(())
     }
 
+    pub fn add_liquidity(ctx: Context<AddLiquidity>, liquidity_amount: u64) -> Result<()> {
+        ctx.accounts.admin_state.reward_pool_amount = liquidity_amount;
+        token::transfer(
+            ctx.accounts.from_admin_transfer_to_pda_context(),
+            liquidity_amount,
+        )?;
+
+        Ok(())
+    }
+
     pub fn stake(ctx: Context<Stake>, stake_amount: u64) -> Result<()> {
         let clock = Clock::get()?;
         let diff_time = clock.unix_timestamp - ctx.accounts.user_state.stake_date;
@@ -53,6 +65,10 @@ pub mod anchor_escrow {
 
         ctx.accounts.user_state.stake_amount = ctx.accounts.user_state.stake_amount + stake_amount;
         ctx.accounts.user_state.stake_date = clock.unix_timestamp;
+        ctx.accounts.admin_state.locked_amount =
+            ctx.accounts.admin_state.locked_amount + stake_amount;
+        ctx.accounts.admin_state.total_amount =
+            ctx.accounts.admin_state.total_amount + stake_amount;
 
         // transfer tokens to vault account
         token::transfer(ctx.accounts.into_transfer_to_pda_context(), stake_amount)?;
@@ -74,34 +90,21 @@ pub mod anchor_escrow {
 
         ctx.accounts.user_state.stake_date = clock.unix_timestamp;
 
-        let transfer_ctx = CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
-            Transfer {
-                from: ctx.accounts.vault.to_account_info(),
-                to: ctx.accounts.staker_deposit_token_account.to_account_info(),
-                authority: ctx.accounts.vault.to_account_info(),
-            },
-        );
         let bump = *ctx.bumps.get("vault").unwrap();
         let stake_token_key = ctx.accounts.stake_token.key();
         let pda_sign = &[&b"vault"[..], stake_token_key.as_ref(), &[bump]];
 
         token::transfer(
-            transfer_ctx.with_signer(&[pda_sign]),
+            ctx.accounts
+                .from_pda_transfer_into_staker_context()
+                .with_signer(&[pda_sign]),
             stake_reward * (100 - ctx.accounts.admin_state.admin_fee) / 100,
         )?;
 
-        let transfer_ctx = CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
-            Transfer {
-                from: ctx.accounts.vault.to_account_info(),
-                to: ctx.accounts.admin_deposit_token_account.to_account_info(),
-                authority: ctx.accounts.vault.to_account_info(),
-            },
-        );
-
         token::transfer(
-            transfer_ctx.with_signer(&[pda_sign]),
+            ctx.accounts
+                .from_pda_transfer_into_admin_context()
+                .with_signer(&[pda_sign]),
             stake_reward * ctx.accounts.admin_state.admin_fee / 100,
         )?;
 
@@ -112,49 +115,42 @@ pub mod anchor_escrow {
     pub fn unstake(ctx: Context<Unstake>) -> Result<()> {
         let clock = Clock::get()?;
         let diff_time = clock.unix_timestamp - ctx.accounts.user_state.stake_date;
+        if ctx.accounts.admin_state.lock_period > diff_time.try_into().unwrap() {
+            return Err(Error::NeedToWaitUntilLockPeriod.into());
+        }
         let stake_reward = ctx.accounts.user_state.stake_amount
             * ctx.accounts.admin_state.reward_rate / 100   // need to divide by 100 ->> 0.2 = 20 / 100
             * (diff_time as u64) // locking time
             / ctx.accounts.admin_state.lock_period
             + ctx.accounts.user_state.previous_stake_reward; // 180 lock days
-
+        if ctx.accounts.user_state.stake_amount + stake_reward > ctx.accounts.vault.amount {
+            return Err(Error::NeedForSomeBalanceForUnstake.into());
+        }
         ctx.accounts.user_state.previous_stake_reward = 0;
-
         ctx.accounts.user_state.stake_date = clock.unix_timestamp;
+        ctx.accounts.admin_state.locked_amount =
+            ctx.accounts.admin_state.locked_amount - ctx.accounts.user_state.stake_amount;
 
-        let transfer_ctx = CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
-            Transfer {
-                from: ctx.accounts.vault.to_account_info(),
-                to: ctx.accounts.staker_deposit_token_account.to_account_info(),
-                authority: ctx.accounts.vault.to_account_info(),
-            },
-        );
         let bump = *ctx.bumps.get("vault").unwrap();
         let stake_token_key = ctx.accounts.stake_token.key();
         let pda_sign = &[&b"vault"[..], stake_token_key.as_ref(), &[bump]];
 
         token::transfer(
-            transfer_ctx.with_signer(&[pda_sign]),
+            ctx.accounts
+                .from_pda_transfer_into_staker_context()
+                .with_signer(&[pda_sign]),
             stake_reward * (100 - ctx.accounts.admin_state.admin_fee) / 100
                 + ctx.accounts.user_state.stake_amount,
         )?;
 
-        ctx.accounts.user_state.stake_amount = 0;
-
-        let transfer_ctx = CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
-            Transfer {
-                from: ctx.accounts.vault.to_account_info(),
-                to: ctx.accounts.admin_deposit_token_account.to_account_info(),
-                authority: ctx.accounts.vault.to_account_info(),
-            },
-        );
-
         token::transfer(
-            transfer_ctx.with_signer(&[pda_sign]),
+            ctx.accounts
+                .from_pda_transfer_into_admin_context()
+                .with_signer(&[pda_sign]),
             stake_reward * ctx.accounts.admin_state.admin_fee / 100,
         )?;
+
+        ctx.accounts.user_state.stake_amount = 0;
 
         Ok(())
     }
@@ -225,6 +221,41 @@ pub struct UpdateAdminInfo<'info> {
     pub admin_state: Box<Account<'info, AdminState>>,
 }
 
+// need to add liquidity before start staking for staking reward
+#[derive(Accounts)]
+#[instruction(liquidity_amount: u64)]
+pub struct AddLiquidity<'info> {
+    /// CHECK: This is not dangerous because we don't read or write from this account
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    #[account(
+        mut,
+        constraint = admin_state.stake_token == *stake_token.to_account_info().key,
+    )]
+    pub stake_token: Account<'info, Mint>,
+    #[account(
+        mut,
+        constraint = admin_state.admin == *admin.key,
+        seeds = [b"state".as_ref(), b"admin".as_ref()],
+        bump = admin_state.bump
+    )]
+    pub admin_state: Box<Account<'info, AdminState>>,
+    #[account(
+        mut,
+        seeds = [b"vault".as_ref(), stake_token.key().as_ref()],
+        bump,
+    )]
+    pub vault: Account<'info, TokenAccount>,
+    #[account(
+        mut,
+        token::mint = stake_token,
+        token::authority = admin,
+    )]
+    pub admin_deposit_token_account: Account<'info, TokenAccount>,
+    /// CHECK: This is not dangerous because we don't read or write from this account
+    pub token_program: Program<'info, Token>,
+}
+
 #[derive(Accounts)]
 #[instruction(stake_amount: u64)]
 pub struct Stake<'info> {
@@ -237,9 +268,13 @@ pub struct Stake<'info> {
         bump = admin_state.bump
     )]
     pub admin_state: Box<Account<'info, AdminState>>,
-    #[account(mut)]
+    #[account(
+        mut,
+        constraint = admin_state.stake_token == *stake_token.to_account_info().key,
+    )]
     pub stake_token: Account<'info, Mint>,
     #[account(
+        mut,
         seeds = [b"vault".as_ref(), stake_token.key().as_ref()],
         bump,
     )]
@@ -271,17 +306,23 @@ pub struct GetReward<'info> {
     /// CHECK: This is not dangerous because we don't read or write from this account
     #[account(mut)]
     pub staker: Signer<'info>,
+    /// CHECK: This is not dangerous because we don't read or write from this account
     #[account(mut)]
     pub admin: AccountInfo<'info>,
     #[account(
         mut,
+        constraint = admin_state.admin == *admin.key,
         seeds = [b"state".as_ref(), b"admin".as_ref()],
         bump = admin_state.bump
     )]
     pub admin_state: Box<Account<'info, AdminState>>,
-    #[account(mut)]
+    #[account(
+        mut,
+        constraint = admin_state.stake_token == *stake_token.to_account_info().key,
+    )]
     pub stake_token: Account<'info, Mint>,
     #[account(
+        mut,
         seeds = [b"vault".as_ref(), stake_token.key().as_ref()],
         bump,
     )]
@@ -296,20 +337,15 @@ pub struct GetReward<'info> {
         mut,
         token::mint = stake_token,
         token::authority = admin,
-        constraint = admin_state.admin == admin.key()
     )]
     pub admin_deposit_token_account: Account<'info, TokenAccount>,
     #[account(
-        init_if_needed,
+        mut,
         seeds = [b"state".as_ref(), b"user".as_ref(), staker.key().as_ref()],
-        bump,
-        payer = staker,
-        space = UserState::space()
+        bump
     )]
     pub user_state: Box<Account<'info, UserState>>,
-    /// CHECK: This is not dangerous because we don't read or write from this account
-    pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
+
     /// CHECK: This is not dangerous because we don't read or write from this account
     pub token_program: Program<'info, Token>,
 }
@@ -319,17 +355,23 @@ pub struct Unstake<'info> {
     /// CHECK: This is not dangerous because we don't read or write from this account
     #[account(mut)]
     pub staker: Signer<'info>,
+    /// CHECK: This is not dangerous because we don't read or write from this account
     #[account(mut)]
     pub admin: AccountInfo<'info>,
     #[account(
         mut,
+        constraint = admin_state.admin == *admin.key,
         seeds = [b"state".as_ref(), b"admin".as_ref()],
         bump = admin_state.bump
     )]
     pub admin_state: Box<Account<'info, AdminState>>,
-    #[account(mut)]
+    #[account(
+        mut,
+        constraint = admin_state.stake_token == *stake_token.to_account_info().key,
+    )]
     pub stake_token: Account<'info, Mint>,
     #[account(
+        mut,
         seeds = [b"vault".as_ref(), stake_token.key().as_ref()],
         bump,
     )]
@@ -348,16 +390,12 @@ pub struct Unstake<'info> {
     )]
     pub admin_deposit_token_account: Account<'info, TokenAccount>,
     #[account(
-        init_if_needed,
+        mut,
         seeds = [b"state".as_ref(), b"user".as_ref(), staker.key().as_ref()],
-        bump,
-        payer = staker,
-        space = UserState::space()
+        bump
     )]
     pub user_state: Box<Account<'info, UserState>>,
-    /// CHECK: This is not dangerous because we don't read or write from this account
-    pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
+
     /// CHECK: This is not dangerous because we don't read or write from this account
     pub token_program: Program<'info, Token>,
 }
@@ -366,10 +404,11 @@ pub struct Unstake<'info> {
 pub struct AdminState {
     pub bump: u8,
     pub admin: Pubkey,
-    pub admin_fee: u64,     // admin will get fee when users withdraw stake reward
-    pub reward_rate: u64,   // reward rate
-    pub lock_period: u64,   // lock period for staking
-    pub total_amount: u64,  // total staked amount all time
+    pub admin_fee: u64, // admin will get fee when users withdraw stake reward
+    pub reward_pool_amount: u64, // staking reward pool charged by admin
+    pub reward_rate: u64, // reward rate
+    pub lock_period: u64, // lock period for staking
+    pub total_amount: u64, // total staked amount all time
     pub locked_amount: u64, // current locked amount
     pub staked_user_amount: u64,
     pub stake_token: Pubkey,
@@ -377,7 +416,7 @@ pub struct AdminState {
 
 impl AdminState {
     pub fn space() -> usize {
-        8 + 1 + 32 + 8 + 8 + 8 + 8 + 8 + 8 + 32
+        8 + 1 + 32 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 32
     }
 }
 
@@ -406,4 +445,70 @@ impl<'info> Stake<'info> {
         };
         CpiContext::new(self.token_program.to_account_info(), cpi_accounts)
     }
+}
+
+impl<'info> AddLiquidity<'info> {
+    fn from_admin_transfer_to_pda_context(&self) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
+        let cpi_accounts = Transfer {
+            from: self.admin_deposit_token_account.to_account_info(),
+            to: self.vault.to_account_info(),
+            authority: self.admin.to_account_info(),
+        };
+        CpiContext::new(self.token_program.to_account_info(), cpi_accounts)
+    }
+}
+
+impl<'info> GetReward<'info> {
+    fn from_pda_transfer_into_staker_context(
+        &self,
+    ) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
+        let cpi_accounts = Transfer {
+            from: self.vault.to_account_info(),
+            to: self.staker_deposit_token_account.to_account_info(),
+            authority: self.vault.to_account_info(),
+        };
+        CpiContext::new(self.token_program.to_account_info(), cpi_accounts)
+    }
+
+    fn from_pda_transfer_into_admin_context(
+        &self,
+    ) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
+        let cpi_accounts = Transfer {
+            from: self.vault.to_account_info(),
+            to: self.admin_deposit_token_account.to_account_info(),
+            authority: self.vault.to_account_info(),
+        };
+        CpiContext::new(self.token_program.to_account_info(), cpi_accounts)
+    }
+}
+
+impl<'info> Unstake<'info> {
+    fn from_pda_transfer_into_staker_context(
+        &self,
+    ) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
+        let cpi_accounts = Transfer {
+            from: self.vault.to_account_info(),
+            to: self.staker_deposit_token_account.to_account_info(),
+            authority: self.vault.to_account_info(),
+        };
+        CpiContext::new(self.token_program.to_account_info(), cpi_accounts)
+    }
+    fn from_pda_transfer_into_admin_context(
+        &self,
+    ) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
+        let cpi_accounts = Transfer {
+            from: self.vault.to_account_info(),
+            to: self.admin_deposit_token_account.to_account_info(),
+            authority: self.vault.to_account_info(),
+        };
+        CpiContext::new(self.token_program.to_account_info(), cpi_accounts)
+    }
+}
+
+#[error_code]
+pub enum Error {
+    #[msg("You can't unstake during Lock Period.")]
+    NeedToWaitUntilLockPeriod,
+    #[msg("Not Enough Balance in Vault.")]
+    NeedForSomeBalanceForUnstake,
 }
